@@ -18,9 +18,9 @@
  */
 
 #include <ESP8266WiFi.h>
-#include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <ESP8266WebServer.h>
 
 // Number of relays
 #define MAX_RELAY_NUM 4
@@ -53,28 +53,47 @@ int mqttPort = 1883; // Usually 1883 port is used
 WiFiClient espClient;
 PubSubClient client(espClient);
 
+ESP8266WebServer server(80);
+
 void estabilish_wifi_connection(const char* ssid, const char* passwd);
 void estabilish_mqtt_connection ( PubSubClient *mqtt_client );
-
-void mqtt_subscribe_to_brocker( PubSubClient *client, char* mqttServer, int mqttPort, 
-            char* topic, void (*mqtt_callback)(char* topic, byte* payload, unsigned int length) );
-
 void configure_gpio_pins ();
 void mqtt_callback(char* topic, byte* payload, unsigned int length);
-
+void mqtt_update_status_topic (char* topic);
+void json_interpreter(byte* payload);
+void rest_get_server_status ();
+void rest_put_server_status ();
+void rest_start_server();
+void read_pulse_sw_state(bool update_internal_states);
+unsigned long previous_millis = 0;
 
 void setup(void) {
     configure_gpio_pins();
+    read_pulse_sw_state(true);
     Serial.begin(115200);
+    Serial.println("\n");
+    previous_millis = millis();
 
-    estabilish_wifi_connection(ssid,password);
-    mqtt_subscribe_to_brocker(&client, mqttServer, mqttPort, topic, mqtt_callback );
+    WiFi.enableAP(0);
+    client.setServer(mqttServer, mqttPort);
+    client.setCallback(mqtt_callback);
+    rest_start_server();
 }
 
 void loop() {
+
     estabilish_wifi_connection(ssid,password);
-    estabilish_mqtt_connection(&client);
-    client.loop();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        estabilish_mqtt_connection(&client);
+        client.loop();
+        server.handleClient();
+    }
+
+    if (millis() - previous_millis >= 500) {
+        previous_millis = millis();
+        read_pulse_sw_state(false);
+    }
 }
 
 
@@ -92,66 +111,93 @@ void configure_gpio_pins() {
   pinMode (LED, OUTPUT);
 }
 
-
+// Non blocking method
 void estabilish_wifi_connection(const char* ssid, const char* passwd) {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.print("WiFi not connected, trying with SSID: ");
+
+    static unsigned long previous_millis = millis();
+    static bool try_connect = false;
+
+    if ( (WiFi.status() != WL_CONNECTED) && !try_connect ) {
+        Serial.print("Connecting to WiFi with SSID: ");
         Serial.println(ssid);
-
         WiFi.begin(ssid, passwd);
-        while (WiFi.status() != WL_CONNECTED) {
-        Serial.print(".");
-        delay(500);
+        try_connect = true;
+    }
+
+    if (try_connect) {
+        if (millis() - previous_millis >= 500) {
+            previous_millis = millis();
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.print("Connected with IP: ");
+                Serial.println(WiFi.localIP());
+                try_connect = false;
+            }
         }
-        
-        Serial.println();
-
-        Serial.print("Connected with IP: ");
-        Serial.println(WiFi.localIP());
-
     }
 }
 
-
+// Non blocking method
 void estabilish_mqtt_connection( PubSubClient *mqtt_client ) {
+
+    static unsigned long previous_millis = millis();
+    static bool try_connect = false;
+
     String clientId = "ESP12FClient-Board01";
 
-    while (!mqtt_client->connected()) {
-        Serial.print("Connecting to MQTT with ID: ");
-        Serial.println(clientId);
+    if (WiFi.status() != WL_CONNECTED)
+        return;
 
-        if (mqtt_client->connect(clientId.c_str())) {
-            Serial.println("connected");
-        } 
-        else {
-            Serial.print("failed with state: ");
-            Serial.println(mqtt_client->state());
-            delay(2000);
+    if ( (!mqtt_client->connected()) && !try_connect ) {
+        Serial.print("Connecting to MQTT Broker: ");
+        Serial.println(mqttServer);
+        try_connect = true;
+    }
+
+    if (try_connect) {
+        if (millis() - previous_millis >= 500) {
+            previous_millis = millis();
+            if (mqtt_client->connect(clientId.c_str())) {
+                Serial.print("Connected to MQTT Broker with ID: ");
+                Serial.println(clientId);
+                mqtt_client->subscribe(topic);
+                try_connect = false;
+            } 
+            else {
+                Serial.print("MQTT connection failed with state: ");
+                Serial.println(mqtt_client->state());
+            }
         }
     }
-}
-
-
-void mqtt_subscribe_to_brocker( PubSubClient *client, char* mqttServer, int mqttPort, 
-            char* topic, void (*mqtt_callback)(char* topic, byte* payload, unsigned int length) ) {
-
-    client->setServer(mqttServer, mqttPort);
-    client->setCallback(mqtt_callback);
-
-    estabilish_mqtt_connection(client);
-
-    client->subscribe(topic);
 }
 
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-    DynamicJsonDocument doc(100);
+    Serial.println("Message arrived in topic: ");
+    for(unsigned i=0; i<length; i++) Serial.print((char)payload[i]);
+    Serial.println();
+
+    json_interpreter(payload);
+}
+
+
+void mqtt_update_status_topic (char* topic) {
     char buff[40];
 
-    Serial.print("Message arrived in topic: ");
-    Serial.println(topic);
+    if ( (WiFi.status() != WL_CONNECTED) || (!client.connected()) )
+        return;
 
+    sprintf(buff,"{\"ry1\":%u,\"ry2\":%u,\"ry3\":%u,\"ry4\":%u}", 
+                digitalRead(RELAY_1), digitalRead(RELAY_2), 
+                digitalRead(RELAY_3), digitalRead(RELAY_4)
+            );
+    client.publish(topic, buff, true);
+}
+    
+
+void json_interpreter(byte* payload) {
+    DynamicJsonDocument doc(100);
     deserializeJson(doc, payload);
+
     JsonObject obj = doc.as<JsonObject>();
 
     for(size_t i=0; i < MAX_RELAY_NUM; i++) {
@@ -177,11 +223,78 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                 break;
         }    
     }
+    mqtt_update_status_topic(topic_status);
+}
 
-    sprintf(buff,"{'ry1':%u,'ry2':%u,'ry3':%u,'ry4':%u}", 
-                digitalRead(RELAY_1), digitalRead(RELAY_2), 
-                digitalRead(RELAY_3), digitalRead(RELAY_4)
-            );
 
-    client.publish(topic_status, buff, true);
+void rest_start_server() {
+    server.on("/", HTTP_GET, rest_get_server_status);
+    server.on("/", HTTP_PUT, rest_put_server_status);
+    server.onNotFound([] () {
+        server.send(404, "text/plain", "Route Not Found!");
+    });
+
+    server.begin();
+    Serial.println("REST Server started!");
+}
+
+
+void rest_get_server_status() {
+    char buff[40];
+    sprintf(buff,"{\"ry1\":%u,\"ry2\":%u,\"ry3\":%u,\"ry4\":%u}", 
+        digitalRead(RELAY_1), digitalRead(RELAY_2), 
+        digitalRead(RELAY_3), digitalRead(RELAY_4)
+        );
+    server.send(200, "application/json", buff);
+}
+
+
+void rest_put_server_status() {
+    char buff[50];
+
+    Serial.println("Message arrived in REST: ");
+    Serial.println(server.arg("plain"));
+    
+    server.arg("plain").toCharArray(buff, server.arg("plain").length() + 1);
+    json_interpreter((byte *)buff ); 
+    server.send ( 200, "application/json", server.arg("plain") );
+}
+
+
+void read_pulse_sw_state(bool update_internal_states) {
+    static bool last_states[MAX_RELAY_NUM];
+
+    if (update_internal_states) {
+        last_states[0] = digitalRead(PULSE_SW_1);
+        last_states[1] = digitalRead(PULSE_SW_2);
+        last_states[2] = digitalRead(PULSE_SW_3);
+        last_states[3] = digitalRead(PULSE_SW_4);
+        return;
+    }
+
+    if ((last_states[0] != digitalRead(PULSE_SW_1)) || (last_states[1] != digitalRead(PULSE_SW_2)) || 
+            (last_states[2] != digitalRead(PULSE_SW_3)) || ( last_states[3] != digitalRead(PULSE_SW_4)) ) {
+
+        if (last_states[0] != digitalRead(PULSE_SW_1)){
+            last_states[0] = digitalRead(PULSE_SW_1);
+            digitalWrite(RELAY_1, !digitalRead(RELAY_1));
+        }
+
+        if (last_states[1] != digitalRead(PULSE_SW_2)){
+            last_states[1] = digitalRead(PULSE_SW_2);
+            digitalWrite(RELAY_2, !digitalRead(RELAY_2));
+        }
+
+        if (last_states[2] != digitalRead(PULSE_SW_3)){
+            last_states[2] = digitalRead(PULSE_SW_3);
+            digitalWrite(RELAY_3, !digitalRead(RELAY_3));
+        }
+
+        if ( last_states[3] != digitalRead(PULSE_SW_4)){
+            last_states[3] = digitalRead(PULSE_SW_4);
+            digitalWrite(RELAY_4, !digitalRead(RELAY_4));
+        }
+
+        mqtt_update_status_topic(topic_status);
+    }
 }
